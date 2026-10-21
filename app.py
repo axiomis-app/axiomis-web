@@ -2,6 +2,8 @@ import math
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
+import time
+from threading import Lock
 from difflib import SequenceMatcher
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -10,9 +12,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title='AXIOMIS V3 | Live Fixtures', page_icon='⚽', layout='wide')
+st.set_page_config(page_title='AXIOMIS V3.1 | Live Fixtures', page_icon='⚽', layout='wide')
 st.markdown('''<style>.stApp{background:#0d1929;color:#e9f2f7}h1,h2,h3{color:#e9f2f7}div[data-testid="stMetric"]{background:#15283b;border:1px solid #294457;padding:12px;border-radius:10px}div[data-testid="stMetricValue"]{color:#61e6c5}</style>''', unsafe_allow_html=True)
-st.title('◈ AXIOMIS V3')
+st.title('◈ AXIOMIS V3.1')
 st.caption('LIVE FIXTURES · Gerçek fikstür + geçmiş sonuçlara dayalı Poisson modeli')
 TZ = ZoneInfo('Europe/Istanbul')
 LEAGUES = {
@@ -70,14 +72,42 @@ def load_results():
     except Exception as exc:
         return None, f'Sonuç verisi okunamadı: {exc}'
 
-@st.cache_data(ttl=1800, show_spinner=False)
+# Shared circuit breaker: after a 429, every session stops requesting the API.
+@st.cache_resource
+def api_guard():
+    return {'lock': Lock(), 'blocked_until': 0.0, 'reason': ''}
+
+class RateLimited(Exception):
+    pass
+
+@st.cache_data(ttl=21600, show_spinner=False)
 def fetch_day(day):
-    url = 'https://www.thesportsdb.com/api/v1/json/123/eventsday.php'
-    response = requests.get(url, params={'d': day, 's': 'Soccer'}, timeout=18,
-                            headers={'User-Agent': 'AXIOMIS-V3/1.0'})
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get('events') or []
+    guard = api_guard()
+    with guard['lock']:
+        if time.monotonic() < guard['blocked_until']:
+            raise RateLimited('Sağlayıcı istek sınırı nedeniyle geçici olarak beklemede.')
+        url = 'https://www.thesportsdb.com/api/v1/json/123/eventsday.php'
+        try:
+            response = requests.get(url, params={'d': day, 's': 'Soccer'}, timeout=18,
+                                    headers={'User-Agent': 'AXIOMIS-V3.1/1.0'})
+        except requests.RequestException:
+            # Do not hammer a struggling service on repeated reruns.
+            guard['blocked_until'] = time.monotonic() + 300
+            raise
+        if response.status_code == 429:
+            # Retry-After may be absent or unreliable; use at least 60 minutes.
+            try:
+                retry = int(response.headers.get('Retry-After', '3600'))
+            except (ValueError, TypeError):
+                retry = 3600
+            guard['blocked_until'] = time.monotonic() + max(3600, min(retry, 86400))
+            guard['reason'] = '429 Too Many Requests'
+            raise RateLimited('TheSportsDB 429: İstek limiti doldu. En az 60 dakika yeni istek yapılmayacak.')
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError('Beklenmeyen fikstür yanıtı')
+        return payload.get('events') or []
 
 def league_match(raw, league_label):
     n = norm(raw)
@@ -143,8 +173,7 @@ with st.sidebar:
     start = st.date_input('Başlangıç tarihi', datetime.now(TZ).date())
     days = st.slider('Kaç gün listelensin?', 1, 7, 3)
     only_future = st.checkbox('Yalnızca başlamamış maçlar', value=True)
-    if st.button('Fikstürü yenile'):
-        fetch_day.clear()
+    st.caption('Önbellek 6 saat geçerlidir. Sayfayı yenilemek sağlayıcıya zorla istek göndermez.')
     st.caption('Fikstür: TheSportsDB. Saatler Türkiye saatidir. Veri kaynağı bazı ligleri/günleri eksik sunabilir.')
 
 results, result_error = load_results()
@@ -153,15 +182,28 @@ if result_error:
 
 items = []
 errors = []
+limited = False
+# Limit cold API requests per page load. Previously 7 days meant 7 immediate requests.
+# A user can move the start date to see a different window.
+requested_days = min(days, 2)
+if days > requested_days:
+    st.info(f'İstek sınırını korumak için bu açılışta ilk {requested_days} gün sorgulanıyor. Diğer günler için başlangıç tarihini ilerletin.')
 with st.spinner('Gerçek fikstür sorgulanıyor...'):
-    for n in range(days):
+    for n in range(requested_days):
         day = (start + timedelta(days=n)).isoformat()
         try:
             items.extend(fetch_day(day))
+        except RateLimited as exc:
+            limited = True
+            errors.append(str(exc))
+            break  # Never continue sending requests after 429.
         except (requests.RequestException, ValueError) as exc:
-            errors.append(f'{day}: {exc}')
+            errors.append(f'{day}: Fikstür alınamadı ({type(exc).__name__}).')
 if errors:
-    st.warning('Bazı günler alınamadı: ' + ' | '.join(errors[:3]))
+    st.warning(' | '.join(errors[:3]))
+if limited and not items:
+    st.error('Fikstür servisi şu anda istek kabul etmiyor. Bu durum maç olmadığı anlamına gelmez. Daha sonra tekrar deneyin.')
+    st.stop()
 
 league_events = []
 seen = set()
@@ -183,7 +225,7 @@ for e in items:
 league_events.sort(key=lambda x:x['kickoff'])
 st.subheader(f'{league_label} · {len(league_events)} maç')
 if not league_events:
-    st.info('Seçilen tarih aralığında bu lig için maç bulunamadı. Bu, fikstürde kesinlikle maç olmadığı anlamına gelmez; sağlayıcının kapsamı sınırlı olabilir.')
+    st.info('Sorgulanabilen günlerde bu lig için maç bulunamadı. Sağlayıcının eksik kapsamı veya geçici kısıtlaması nedeniyle maçlar görünmüyor olabilir.')
     st.stop()
 
 labels = [f"{e['kickoff']:%d.%m %H:%M} · {e['home']} — {e['away']}" for e in league_events]
